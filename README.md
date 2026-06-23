@@ -1,2 +1,2 @@
-# gitt
-Git+trace
+# gitp
+Git+prompt
