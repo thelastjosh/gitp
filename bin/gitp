@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# gitp — git + prompt. See gitp/PROTOCOL.md
+set -euo pipefail
+
+GITP_ROOT="$(git rev-parse --git-dir 2>/dev/null)/gitp" || true
+PROMPTS_DIR="${GITP_ROOT}/prompts"
+
+die() { echo "gitp: $*" >&2; exit 1; }
+
+require_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
+}
+
+ensure_dirs() {
+  mkdir -p "$PROMPTS_DIR"
+}
+
+valid_sha() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+now_utc() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -Iseconds
+}
+
+write_prompts() {
+  local sha="$1"
+  shift
+  local -a texts=("$@")
+  local path="${PROMPTS_DIR}/${sha}.json"
+  local at
+  at="$(now_utc)"
+
+  ensure_dirs
+
+  if [[ -f "$path" ]]; then
+    python3 - "$path" "${texts[@]}" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+
+path = sys.argv[1]
+texts = sys.argv[2:]
+with open(path) as f:
+    data = json.load(f)
+now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+for t in texts:
+    data["prompts"].append({"text": t, "at": now})
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+    return
+  fi
+
+  python3 - "$path" "$sha" "$at" "${texts[@]}" <<'PY'
+import json, sys
+
+path, sha, at = sys.argv[1], sys.argv[2], sys.argv[3]
+texts = sys.argv[4:]
+data = {
+    "version": 1,
+    "commit": sha,
+    "prompts": [{"text": t, "at": at} for t in texts],
+}
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+show_prompts() {
+  local sha="$1"
+  local path="${PROMPTS_DIR}/${sha}.json"
+  if [[ ! -f "$path" ]]; then
+    echo "(no prompts)"
+    return
+  fi
+  python3 - "$path" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for i, p in enumerate(data.get("prompts", []), 1):
+    at = p.get("at", "")
+    suffix = f"  ({at})" if at else ""
+    print(f"  [{i}] {p['text']}{suffix}")
+PY
+}
+
+cmd_commit() {
+  require_repo
+  local -a prompts=()
+  local -a git_args=()
+
+  if [[ -n "${GITP_PROMPT:-}" ]]; then
+    prompts+=("$GITP_PROMPT")
+  fi
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--prompt)
+        [[ $# -ge 2 ]] || die "option $1 requires an argument"
+        prompts+=("$2")
+        shift 2
+        ;;
+      --prompt=*)
+        prompts+=("${1#*=}")
+        shift
+        ;;
+      *)
+        git_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  git commit "${git_args[@]}"
+  local sha
+  sha="$(git rev-parse HEAD)"
+
+  if [[ ${#prompts[@]} -gt 0 ]]; then
+    write_prompts "$sha" "${prompts[@]}"
+  fi
+}
+
+cmd_attach() {
+  require_repo
+  [[ $# -ge 1 ]] || die "usage: gitp attach <sha> -p <prompt>..."
+  local sha="$1"
+  shift
+  valid_sha "$sha" || die "invalid commit SHA: $sha"
+
+  local -a prompts=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--prompt)
+        [[ $# -ge 2 ]] || die "option $1 requires an argument"
+        prompts+=("$2")
+        shift 2
+        ;;
+      --prompt=*)
+        prompts+=("${1#*=}")
+        shift
+        ;;
+      *)
+        die "unknown option: $1"
+        ;;
+    esac
+  done
+
+  [[ ${#prompts[@]} -gt 0 ]] || die "at least one -p/--prompt required"
+  write_prompts "$sha" "${prompts[@]}"
+  echo "attached ${#prompts[@]} prompt(s) to ${sha:0:7}"
+}
+
+cmd_prompts() {
+  require_repo
+  local sha
+  sha="${1:-$(git rev-parse HEAD)}"
+  valid_sha "$sha" || die "invalid commit SHA: $sha"
+  echo "prompts for ${sha:0:7}:"
+  show_prompts "$sha"
+}
+
+cmd_log() {
+  require_repo
+  local with_prompts=0
+  local -a git_args=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prompts)
+        with_prompts=1
+        shift
+        ;;
+      *)
+        git_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ $with_prompts -eq 0 ]]; then
+    git log "${git_args[@]}"
+    return
+  fi
+
+  # Print log entries with prompts inline
+  git log --format="%H" "${git_args[@]}" | while read -r sha; do
+    git log -1 --format=$'commit %H\nAuthor: %an <%ae>\nDate:   %ad\n\n    %s\n' "$sha"
+    local path="${PROMPTS_DIR}/${sha}.json"
+    if [[ -f "$path" ]]; then
+      echo "    Prompts:"
+      show_prompts "$sha" | sed 's/^/    /'
+    fi
+    echo
+  done
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+
+  case "$cmd" in
+    commit)  cmd_commit "$@" ;;
+    attach)  cmd_attach "$@" ;;
+    prompts) cmd_prompts "$@" ;;
+    log)     cmd_log "$@" ;;
+    ""|-h|--help|help)
+      cat <<'EOF'
+gitp — git + prompt
+
+Usage:
+  gitp commit [-p <prompt>]... [<git commit options>]
+  gitp attach <sha> -p <prompt>...
+  gitp prompts [<sha>]
+  gitp log [--prompts] [<git log options>]
+  gitp <git-command>   pass-through to git
+
+Environment:
+  GITP_PROMPT   default prompt for gitp commit
+
+See gitp/PROTOCOL.md for the full protocol specification.
+EOF
+      ;;
+    *)
+      git "$cmd" "$@"
+      ;;
+  esac
+}
+
+main "$@"
