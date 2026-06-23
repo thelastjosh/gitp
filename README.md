@@ -1,12 +1,10 @@
-# gitt
+# gitp
 
-Git + trace
-
-## gitp — git + prompt
+Git + prompt
 
 A minimal protocol for attaching prompts to commits. See [gitp/PROTOCOL.md](gitp/PROTOCOL.md).
 
-### Quick start
+## Quick start
 
 ```bash
 # Add bin/ to PATH, or symlink gitp into your PATH
